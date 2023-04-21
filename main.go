@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -19,55 +20,71 @@ type RequestBody struct {
 }
 
 type rateLimitterStruct struct {
-	// tokens      int
-	// fillRate    float64
+	tokens      int
+	fillRate    float64
 	lastUpdated time.Time
-	// resetTicker *time.Ticker
-	requests int
+	// requests    int
 }
 
-var rl = newRateLimitter()
+type rateLimitterMap struct {
+	sync.Mutex
+	m map[string]*rateLimitterStruct
+}
+
+var rlm = newRateLimitterMap()
 
 // func newRateLimitter(tokens int, fillRate float64) *rateLimitterStruct {
-func newRateLimitter() *rateLimitterStruct {
-	rateLimitterVal := &rateLimitterStruct{
-		// tokens:      tokens,
-		// fillRate:    fillRate,
-		lastUpdated: time.Now(),
-		requests:    0,
-		// resetTicker: time.NewTicker(time.Minute),
+func newRateLimitterMap() *rateLimitterMap {
+	rateLM := rateLimitterMap{
+		m: make(map[string]*rateLimitterStruct),
 	}
 	ticker := time.NewTicker(time.Minute)
 	go func() {
 		for range ticker.C {
-			rateLimitterVal.requests = 0
-			rateLimitterVal.lastUpdated = time.Now()
+			rateLM.cleanupExpired()
 		}
 	}()
-	return rateLimitterVal
+	return &rateLM
+}
+
+func (rlm *rateLimitterMap) get(userId string, tokens int, fillrate float64) *rateLimitterStruct {
+	rlm.Lock()
+	defer rlm.Unlock()
+	rl, ok := rlm.m[userId]
+	if !ok {
+		rl = &rateLimitterStruct{
+			tokens:      tokens,
+			fillRate:    fillrate,
+			lastUpdated: time.Now(),
+		}
+		rlm.m[userId] = rl
+	}
+	return rl
+}
+
+func (rlm *rateLimitterMap) cleanupExpired() {
+	rlm.Lock()
+	defer rlm.Unlock()
+	now := time.Now()
+	for userId, rl := range rlm.m {
+		timeElapsed := now.Sub(rl.lastUpdated)
+		if timeElapsed.Minutes() >= 1 {
+			delete(rlm.m, userId)
+		}
+	}
 }
 
 func (r *rateLimitterStruct) allowRequest() bool {
-	// now := time.Now()
-	// timeElapsed := now.Sub(r.lastUpdated)
-	// if timeElapsed.Minutes() >= 1 {
-	// 	r.requests = 0
-	//     r.lastUpdated = now
-	// }
-	// r.tokens += int(r.fillRate * now.Sub(r.lastUpdated).Seconds())
-	// if r.tokens > maxTokens {
-	// 	r.tokens = maxTokens
-	// 	return false
-	// }
-	if r.requests < maxTokens {
-		r.requests++
+	now := time.Now()
+	r.tokens += int(r.fillRate * now.Sub(r.lastUpdated).Seconds())
+	if r.tokens < maxTokens {
+		return false
+	}
+	r.lastUpdated = now
+	if r.tokens > 0 {
+		r.tokens--
 		return true
 	}
-	// r.lastUpdated = now
-	// if r.tokens > 0 {
-	// 	r.tokens--
-	// 	return true
-	// }
 	return false
 }
 
@@ -92,6 +109,7 @@ func rateLimitter(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	rl := rlm.get(requestBody.UserId, 0, 10)
 	if rl.allowRequest() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Request processed successfully"))
