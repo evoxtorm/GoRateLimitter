@@ -4,86 +4,82 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sync"
-	"time"
+	"strconv"
 
+	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/gorilla/mux"
 )
 
 const maxTokens = 10
 
 type RequestBody struct {
-	UserId   string                 `json:"user_id"`
+	UserId   string                 `json:"userId"`
 	Endpoint string                 `json:"endpoint`
 	Limit    int                    `json: limit`
 	Body     map[string]interface{} `json: body`
 }
 
-type rateLimitterStruct struct {
-	tokens      int
-	fillRate    float64
-	lastUpdated time.Time
-	// requests    int
-}
+// type rateLimitterStruct struct {
+// 	tokens int
+// 	// fillRate    float64
+// 	lastUpdated time.Time
+// 	// requests    int
+// }
 
 type rateLimitterMap struct {
-	sync.Mutex
-	m map[string]*rateLimitterStruct
+	mc *memcache.Client
 }
 
 var rlm = newRateLimitterMap()
 
 // func newRateLimitter(tokens int, fillRate float64) *rateLimitterStruct {
 func newRateLimitterMap() *rateLimitterMap {
-	rateLM := rateLimitterMap{
-		m: make(map[string]*rateLimitterStruct),
+	memcacheClient := memcache.New("localhost:11211")
+	err := memcacheClient.FlushAll()
+	if err != nil {
+		fmt.Printf("Error flushing memcache: %v", err)
 	}
-	ticker := time.NewTicker(time.Minute)
-	go func() {
-		for range ticker.C {
-			rateLM.cleanupExpired()
-		}
-	}()
-	return &rateLM
+	return &rateLimitterMap{memcacheClient}
 }
 
-func (rlm *rateLimitterMap) get(userId string, tokens int, fillrate float64) *rateLimitterStruct {
-	rlm.Lock()
-	defer rlm.Unlock()
-	rl, ok := rlm.m[userId]
-	if !ok {
-		rl = &rateLimitterStruct{
-			tokens:      tokens,
-			fillRate:    fillrate,
-			lastUpdated: time.Now(),
+func (rlm *rateLimitterMap) get(userId string, tokens int) (*memcache.Item, error) {
+	key := "ratelimit_" + userId
+	item, err := rlm.mc.Get(key)
+	if err != nil {
+		if err == memcache.ErrCacheMiss {
+			// Construct a new item with the desired values
+			item = &memcache.Item{
+				Key:        key,
+				Value:      []byte(fmt.Sprintf("%d", tokens)),
+				Expiration: 60,
+			}
+			if err := rlm.mc.Set(item); err != nil {
+				return nil, fmt.Errorf("error setting rate limiter for user %s: %v", userId, err)
+			}
+			return item, nil
 		}
-		rlm.m[userId] = rl
+		return nil, fmt.Errorf("error getting rate limiter for user %s: %v", userId, err)
 	}
-	return rl
+	return item, nil
 }
 
-func (rlm *rateLimitterMap) cleanupExpired() {
-	rlm.Lock()
-	defer rlm.Unlock()
-	now := time.Now()
-	for userId, rl := range rlm.m {
-		timeElapsed := now.Sub(rl.lastUpdated)
-		if timeElapsed.Minutes() >= 1 {
-			delete(rlm.m, userId)
+func (r *rateLimitterMap) allowRequest(item *memcache.Item) bool {
+	if item != nil {
+		tokenStr := string(item.Value)
+		tokenInt, err := strconv.Atoi(tokenStr)
+		if err != nil {
+			fmt.Println("Error converting token to int:", err)
+			return false
 		}
-	}
-}
-
-func (r *rateLimitterStruct) allowRequest() bool {
-	now := time.Now()
-	r.tokens += int(r.fillRate * now.Sub(r.lastUpdated).Seconds())
-	if r.tokens < maxTokens {
-		return false
-	}
-	r.lastUpdated = now
-	if r.tokens > 0 {
-		r.tokens--
-		return true
+		if tokenInt > 0 {
+			tokenInt -= 1
+			item.Value = []byte(fmt.Sprintf("%d", tokenInt))
+			if err := r.mc.Set(item); err != nil {
+				fmt.Println(err, "Error while setting the token")
+				return false
+			}
+			return true
+		}
 	}
 	return false
 }
@@ -109,8 +105,13 @@ func rateLimitter(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	rl := rlm.get(requestBody.UserId, 0, 10)
-	if rl.allowRequest() {
+	item, err := rlm.get(requestBody.UserId, requestBody.Limit)
+	if err != nil {
+		fmt.Println(err)
+		http.Error(w, "Some error in getting the value", http.StatusTooManyRequests)
+		return
+	}
+	if rlm.allowRequest(item) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Request processed successfully"))
 	} else {
